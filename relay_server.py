@@ -130,7 +130,6 @@ async def health(request: web.Request):
 async def main():
     app = web.Application()
     app.router.add_get("/",   health)
-    app.router.add_head("/",  health)
     app.router.add_get("/ws", ws_handler)
 
     runner = web.AppRunner(app)
