@@ -1,11 +1,9 @@
 """
-RemoteDesk Relay Server
-Uses aiohttp — handles HTTP health checks + WebSocket on same port.
+RemoteDesk Relay Server — aiohttp WebSocket
 Works on render.com free tier.
 """
 import asyncio, json, logging, os
-from aiohttp import web
-import aiohttp
+from aiohttp import web, WSMsgType
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [RELAY] %(message)s",
@@ -13,22 +11,25 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger("relay")
 
 PORT    = int(os.environ.get("PORT", 10000))
-TIMEOUT = 600   # 10 min
+TIMEOUT = 600
 
-# device_id → asyncio.Queue (holds the viewer WS when one connects)
 registry: dict[str, asyncio.Queue] = {}
 
 
-# ── WebSocket handler ─────────────────────────────────────────────────────────
-
 async def ws_handler(request: web.Request):
-    ws = web.WebSocketResponse(max_msg_size=10 * 1024 * 1024)
+    ws = web.WebSocketResponse(
+        max_msg_size=10 * 1024 * 1024,
+        heartbeat=30,        # aiohttp sends ping every 30s automatically
+        receive_timeout=120, # close if no data for 2 min
+    )
     await ws.prepare(request)
 
     try:
-        first = await asyncio.wait_for(ws.receive(), timeout=15)
-        if first.type != aiohttp.WSMsgType.TEXT:
+        first = await asyncio.wait_for(ws.receive(), timeout=20)
+        if first.type != WSMsgType.TEXT:
+            await ws.close()
             return ws
+
         data = json.loads(first.data)
         role = data.get("role", "")
 
@@ -47,7 +48,7 @@ async def ws_handler(request: web.Request):
     return ws
 
 
-async def _handle_host(ws: web.WebSocketResponse, data: dict):
+async def _handle_host(ws, data):
     device_id = data.get("device_id", "").strip()
     if not device_id:
         await ws.send_str(json.dumps({"status": "error", "msg": "no device_id"}))
@@ -72,7 +73,7 @@ async def _handle_host(ws: web.WebSocketResponse, data: dict):
     log.info(f"Session {device_id} ended")
 
 
-async def _handle_viewer(ws: web.WebSocketResponse, data: dict):
+async def _handle_viewer(ws, data):
     device_id = data.get("device_id", "").strip()
     log.info(f"Viewer → {device_id}")
 
@@ -87,25 +88,30 @@ async def _handle_viewer(ws: web.WebSocketResponse, data: dict):
     await ws.send_str(json.dumps({"status": "connected"}))
     await q.put(ws)
 
-    # Stay alive while pipe runs
     try:
         await asyncio.wait_for(ws.wait_closed(), timeout=TIMEOUT)
     except Exception:
         pass
 
 
-async def _pipe(a: web.WebSocketResponse, b: web.WebSocketResponse):
+async def _pipe(a, b):
     async def fwd(src, dst):
         try:
             async for msg in src:
                 if dst.closed:
                     break
-                if msg.type == aiohttp.WSMsgType.BINARY:
+                if msg.type == WSMsgType.BINARY:
                     await dst.send_bytes(msg.data)
-                elif msg.type == aiohttp.WSMsgType.TEXT:
+                elif msg.type == WSMsgType.TEXT:
+                    # Skip internal JSON control messages (waiting/connected)
+                    try:
+                        j = json.loads(msg.data)
+                        if "status" in j:
+                            continue
+                    except Exception:
+                        pass
                     await dst.send_str(msg.data)
-                elif msg.type in (aiohttp.WSMsgType.CLOSE,
-                                  aiohttp.WSMsgType.ERROR):
+                elif msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
                     break
         except Exception:
             pass
@@ -116,16 +122,12 @@ async def _pipe(a: web.WebSocketResponse, b: web.WebSocketResponse):
     await asyncio.gather(fwd(a, b), fwd(b, a), return_exceptions=True)
 
 
-# ── HTTP health check ─────────────────────────────────────────────────────────
-
-async def health(request: web.Request):
+async def health(request):
     return web.Response(
         text=f"RemoteDesk Relay OK — {len(registry)} host(s) online",
         content_type="text/plain"
     )
 
-
-# ── App ───────────────────────────────────────────────────────────────────────
 
 async def main():
     app = web.Application()
@@ -138,7 +140,6 @@ async def main():
     await site.start()
 
     log.info(f"Relay ready on port {PORT}")
-    log.info(f"Connect via: wss://YOUR-APP.onrender.com/ws")
     await asyncio.Future()
 
 
