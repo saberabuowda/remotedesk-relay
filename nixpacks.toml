@@ -1,0 +1,8 @@
+[phases.setup]
+nixPkgs = ["python311"]
+
+[phases.install]
+cmds = ["pip install -r relay_requirements.txt"]
+
+[start]
+cmd = "python relay_server.py"
