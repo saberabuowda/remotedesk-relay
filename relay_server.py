@@ -1,7 +1,3 @@
-"""
-RemoteDesk Relay Server — aiohttp WebSocket
-Works on render.com free tier.
-"""
 import asyncio, json, logging, os
 from aiohttp import web, WSMsgType
 
@@ -10,19 +6,21 @@ logging.basicConfig(level=logging.INFO,
                     datefmt="%H:%M:%S")
 log = logging.getLogger("relay")
 
-PORT    = int(os.environ.get("PORT", 10000))
-TIMEOUT = 600
+PORT = int(os.environ.get("PORT", 10000))
 
-registry: dict[str, asyncio.Queue] = {}
-
+# Store WebSockets: device_id -> {"host": ws, "viewer": ws}
+rooms = {}
 
 async def ws_handler(request: web.Request):
     ws = web.WebSocketResponse(
         max_msg_size=10 * 1024 * 1024,
-        heartbeat=30,        # aiohttp sends ping every 30s automatically
-        receive_timeout=120, # close if no data for 2 min
+        heartbeat=30,
+        receive_timeout=120,
     )
     await ws.prepare(request)
+
+    role = None
+    device_id = None
 
     try:
         first = await asyncio.wait_for(ws.receive(), timeout=20)
@@ -32,116 +30,93 @@ async def ws_handler(request: web.Request):
 
         data = json.loads(first.data)
         role = data.get("role", "")
+        device_id = data.get("device_id", "").strip()
 
+        if not device_id:
+            await ws.close()
+            return ws
+
+        if device_id not in rooms:
+            rooms[device_id] = {"host": None, "viewer": None}
+
+        # 1. Register peer
         if role == "host":
-            await _handle_host(ws, data)
+            rooms[device_id]["host"] = ws
+            log.info(f"Host {device_id} registered")
+            await ws.send_str(json.dumps({"status": "waiting"}))
         elif role == "viewer":
-            await _handle_viewer(ws, data)
-        elif role == "ping":
-            await ws.send_str(json.dumps({"status": "pong"}))
+            if rooms[device_id]["host"] is None:
+                await ws.send_str(json.dumps({"status": "error", "msg": "Device not found or offline"}))
+                await ws.close()
+                return ws
+            
+            rooms[device_id]["viewer"] = ws
+            log.info(f"Viewer {device_id} connected")
+            
+            # Notify both
+            await ws.send_str(json.dumps({"status": "connected"}))
+            await rooms[device_id]["host"].send_str(json.dumps({"status": "connected"}))
         else:
-            await ws.send_str(json.dumps({"status": "error", "msg": "unknown role"}))
+            await ws.close()
+            return ws
+
+        # 2. Main message loop (Task-Safe reading)
+        async for msg in ws:
+            partner_ws = None
+            if role == "host":
+                partner_ws = rooms[device_id]["viewer"]
+            elif role == "viewer":
+                partner_ws = rooms.get(device_id, {}).get("host")
+
+            if not partner_ws or partner_ws.closed:
+                continue
+
+            if msg.type == WSMsgType.BINARY:
+                await partner_ws.send_bytes(msg.data)
+            elif msg.type == WSMsgType.TEXT:
+                # Filter out pure control messages
+                try:
+                    j = json.loads(msg.data)
+                    if "role" in j:
+                        continue 
+                except:
+                    pass
+                await partner_ws.send_str(msg.data)
 
     except Exception as e:
-        log.debug(f"ws_handler error: {e}")
+        log.debug(f"ws_handler err {device_id}: {e}")
+    finally:
+        log.info(f"{role} {device_id} cleanly disconnected")
+        # Cleanup
+        if device_id in rooms:
+            if role == "host":
+                rooms[device_id]["host"] = None
+                # If host leaves, try to close viewer
+                if rooms[device_id]["viewer"]:
+                    try: await rooms[device_id]["viewer"].close()
+                    except: pass
+            elif role == "viewer":
+                rooms[device_id]["viewer"] = None
+            
+            # Remove room if both empty
+            if rooms[device_id]["host"] is None and rooms[device_id]["viewer"] is None:
+                del rooms[device_id]
 
     return ws
 
-
-async def _handle_host(ws, data):
-    device_id = data.get("device_id", "").strip()
-    if not device_id:
-        await ws.send_str(json.dumps({"status": "error", "msg": "no device_id"}))
-        return
-
-    log.info(f"Host {device_id} registered")
-    q: asyncio.Queue = asyncio.Queue(maxsize=1)
-    registry[device_id] = q
-    await ws.send_str(json.dumps({"status": "waiting"}))
-
-    try:
-        viewer_ws = await asyncio.wait_for(q.get(), timeout=TIMEOUT)
-    except asyncio.TimeoutError:
-        log.info(f"Host {device_id} timed out")
-        return
-    finally:
-        registry.pop(device_id, None)
-
-    log.info(f"Piping {device_id}")
-    await ws.send_str(json.dumps({"status": "connected"}))
-    await _pipe(ws, viewer_ws)
-    log.info(f"Session {device_id} ended")
-
-
-async def _handle_viewer(ws, data):
-    device_id = data.get("device_id", "").strip()
-    log.info(f"Viewer → {device_id}")
-
-    q = registry.get(device_id)
-    if q is None:
-        await ws.send_str(json.dumps({
-            "status": "error",
-            "msg": "Device not found or offline"
-        }))
-        return
-
-    await ws.send_str(json.dumps({"status": "connected"}))
-    await q.put(ws)
-
-    try:
-        await asyncio.wait_for(ws.wait_closed(), timeout=TIMEOUT)
-    except Exception:
-        pass
-
-
-async def _pipe(a, b):
-    async def fwd(src, dst):
-        try:
-            async for msg in src:
-                if dst.closed:
-                    break
-                if msg.type == WSMsgType.BINARY:
-                    await dst.send_bytes(msg.data)
-                elif msg.type == WSMsgType.TEXT:
-                    # Skip internal JSON control messages (waiting/connected)
-                    try:
-                        j = json.loads(msg.data)
-                        if "status" in j:
-                            continue
-                    except Exception:
-                        pass
-                    await dst.send_str(msg.data)
-                elif msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
-                    break
-        except Exception:
-            pass
-        finally:
-            try: await dst.close()
-            except: pass
-
-    await asyncio.gather(fwd(a, b), fwd(b, a), return_exceptions=True)
-
-
 async def health(request):
-    return web.Response(
-        text=f"RemoteDesk Relay OK — {len(registry)} host(s) online",
-        content_type="text/plain"
-    )
-
+    return web.Response(text=f"RemoteDesk Relay OK | Active Rooms: {len(rooms)}")
 
 async def main():
     app = web.Application()
-    app.router.add_get("/",   health)
+    app.router.add_get("/", health)
     app.router.add_get("/ws", ws_handler)
-
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-
     log.info(f"Relay ready on port {PORT}")
     await asyncio.Future()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
